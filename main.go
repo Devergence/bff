@@ -10,6 +10,7 @@ import (
 	"github.com/gorilla/mux" // Router
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq" // PostgreSQL driver
+	"golang.org/x/crypto/bcrypt"
 	"log"
 	"net/http"
 	"os"
@@ -24,6 +25,12 @@ const (
 )
 
 var db *sql.DB
+
+// Структура для передачи данных регистрации
+type RegisterRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
 
 // CartItem - структура товара в корзине
 type CartItem struct {
@@ -94,22 +101,54 @@ func initDB() {
 	fmt.Println("Successfully connected to the database")
 }
 
-// Регистрация пользователя
-func registerUser(w http.ResponseWriter, r *http.Request) {
-	var user User
-	if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
+// Регистрация покупателя
+func registerBuyer(w http.ResponseWriter, r *http.Request) {
+	var req RegisterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid input", http.StatusBadRequest)
 		return
 	}
-
-	query := `INSERT INTO users (username, password, role) VALUES ($1, $2, $3)`
-	_, err := db.Exec(query, user.Username, user.Password, user.Role)
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
-		http.Error(w, "Unable to register user", http.StatusInternalServerError)
+		http.Error(w, "Unable to hash password", http.StatusInternalServerError)
+		return
+	}
+
+	query := `INSERT INTO users (username, password, role) VALUES ($1, $2, 'buyer') RETURNING id`
+	var userID int
+	err = db.QueryRow(query, req.Username, hashedPassword).Scan(&userID)
+	if err != nil {
+		http.Error(w, "Unable to register buyer", http.StatusInternalServerError)
 		return
 	}
 
 	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]interface{}{"user_id": userID, "role": "buyer"})
+}
+
+// Регистрация продавца
+func registerSeller(w http.ResponseWriter, r *http.Request) {
+	var req RegisterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid input", http.StatusBadRequest)
+		return
+	}
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		http.Error(w, "Unable to hash password", http.StatusInternalServerError)
+		return
+	}
+
+	query := `INSERT INTO users (username, password, role) VALUES ($1, $2, 'seller') RETURNING id`
+	var userID int
+	err = db.QueryRow(query, req.Username, hashedPassword).Scan(&userID)
+	if err != nil {
+		http.Error(w, "Unable to register seller", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]interface{}{"user_id": userID, "role": "seller"})
 }
 
 // Вход пользователя и выдача токена
@@ -469,14 +508,50 @@ func checkout(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"order_id": orderID, "total_amount": totalAmount})
 }
 
+// Назначение роли администратора
+func makeAdmin(w http.ResponseWriter, r *http.Request) {
+	// Извлекаем данные токена, чтобы убедиться, что пользователь - администратор
+	claims := r.Context().Value("claims").(*Claims)
+	if claims.Role != "admin" {
+		http.Error(w, "Access denied", http.StatusForbidden)
+		return
+	}
+
+	// Извлекаем ID пользователя, которого хотим сделать администратором
+	var req struct {
+		UserID int `json:"user_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid input", http.StatusBadRequest)
+		return
+	}
+
+	// Обновляем роль пользователя в базе данных
+	query := `UPDATE users SET role = 'admin' WHERE id = $1`
+	_, err := db.Exec(query, req.UserID)
+	if err != nil {
+		http.Error(w, "Unable to update role", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "User role updated to admin"})
+}
+
 func main() {
 	initDB()
 
 	router := mux.NewRouter()
 
+	// Маршруты для регистрации
+	router.HandleFunc("/register/buyer", registerBuyer).Methods("POST")
+	router.HandleFunc("/register/seller", registerSeller).Methods("POST")
+
 	// Маршруты аутентификации
-	router.HandleFunc("/register", registerUser).Methods("POST")
 	router.HandleFunc("/login", loginUser).Methods("POST")
+
+	// Маршрут для назначения роли администратора
+	router.HandleFunc("/makeAdmin", authenticate("admin", makeAdmin)).Methods("POST")
 
 	// Маршруты для работы с продуктами
 	router.HandleFunc("/products", authenticate("seller", createProduct)).Methods("POST")       // Только продавец
